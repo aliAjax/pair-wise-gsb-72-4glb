@@ -10,6 +10,7 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
+  Divider,
   LinearProgress,
   MenuItem,
   Stack,
@@ -24,9 +25,12 @@ import {
 } from '@mui/material'
 import DownloadOutlinedIcon from '@mui/icons-material/DownloadOutlined'
 import UndoOutlinedIcon from '@mui/icons-material/UndoOutlined'
+import VisibilityOutlinedIcon from '@mui/icons-material/VisibilityOutlined'
 import { Link } from 'react-router-dom'
 import { useGetAuditQuery, useGetFlagsQuery, useRollbackFlagMutation } from '@/services/flagApi'
 import { FlagStatusChip } from '@/components/FlagStatusChip'
+import { formatFieldValue } from '@/services/flagFields'
+import type { AuditEvent, AuditFieldChange } from '@/types'
 
 const actionLabel: Record<string, string> = {
   created: '创建',
@@ -40,6 +44,12 @@ const actionLabel: Record<string, string> = {
   'rollout-adjusted': '调整灰度',
 }
 
+const resolutionLabel: Record<NonNullable<AuditFieldChange['resolution']>, string> = {
+  mine: '采用本页修改',
+  theirs: '采用对端已保存',
+  base: '保留打开时旧值',
+}
+
 export function AuditPage() {
   const { data: flags = [] } = useGetFlagsQuery({})
   const [flagId, setFlagId] = useState('')
@@ -49,6 +59,7 @@ export function AuditPage() {
   const [selectedFlagId, setSelectedFlagId] = useState('')
   const [reason, setReason] = useState('')
   const [message, setMessage] = useState('')
+  const [detailEvent, setDetailEvent] = useState<AuditEvent | null>(null)
 
   const selectedFlag = flags.find((flag) => flag.id === selectedFlagId)
   const totalImpact = useMemo(
@@ -77,7 +88,7 @@ export function AuditPage() {
         <Box>
           <Typography variant="h2">审计与回滚</Typography>
           <Typography color="text.secondary">
-            查看每次配置调整、审批、冻结和异常回滚记录，并追踪受影响用户范围。
+            查看每次配置调整、审批、冻结和异常回滚记录；版本化保存逐字段留存旧值，冲突定稿全程可追溯。
           </Typography>
         </Box>
         <Button variant="outlined" startIcon={<DownloadOutlinedIcon />} onClick={() => window.print()}>
@@ -119,7 +130,7 @@ export function AuditPage() {
                 <TableCell>时间 / 操作</TableCell>
                 <TableCell>功能开关</TableCell>
                 <TableCell>变更说明</TableCell>
-                <TableCell>状态变化</TableCell>
+                <TableCell>状态 / 版本</TableCell>
                 <TableCell>影响用户</TableCell>
                 <TableCell align="right">操作</TableCell>
               </TableRow>
@@ -139,24 +150,47 @@ export function AuditPage() {
                       <Typography component={Link} to={`/flags/${event.flagId}`} variant="body2" fontWeight={700}>{event.flagKey}</Typography>
                       {relatedFlag && <FlagStatusChip status={relatedFlag.status} />}
                     </TableCell>
-                    <TableCell sx={{ maxWidth: 420 }}>{event.summary}</TableCell>
+                    <TableCell sx={{ maxWidth: 420 }}>
+                      {event.summary}
+                      {event.conflictResolved && (
+                        <Chip size="small" color="warning" variant="outlined" sx={{ ml: 1 }} label="冲突定稿" />
+                      )}
+                    </TableCell>
                     <TableCell>
-                      <Chip size="small" variant="outlined" label={`${event.before || '-'} → ${event.after || '-'}`} />
+                      {event.fromVersion ? (
+                        <Chip size="small" variant="outlined" label={`v${event.fromVersion} → v${event.toVersion}`} />
+                      ) : (
+                        <Chip size="small" variant="outlined" label={`${event.before || '-'} → ${event.after || '-'}`} />
+                      )}
+                      {event.fieldChanges && event.fieldChanges.length > 0 && (
+                        <Chip size="small" variant="outlined" sx={{ ml: 0.5 }} label={`${event.fieldChanges.length} 个字段`} />
+                      )}
                     </TableCell>
                     <TableCell>{event.affectedUsers.toLocaleString()}</TableCell>
                     <TableCell align="right">
-                      <Button
-                        size="small"
-                        color="error"
-                        startIcon={<UndoOutlinedIcon />}
-                        disabled={!relatedFlag || relatedFlag.status === 'rolled-back'}
-                        onClick={() => {
-                          setSelectedFlagId(event.flagId)
-                          setReason('生产异常触发人工回滚，停止继续放量。')
-                        }}
-                      >
-                        回滚
-                      </Button>
+                      <Stack direction="row" spacing={0.5} justifyContent="flex-end">
+                        {event.fieldChanges && event.fieldChanges.length > 0 && (
+                          <Button
+                            size="small"
+                            startIcon={<VisibilityOutlinedIcon />}
+                            onClick={() => setDetailEvent(event)}
+                          >
+                            字段明细
+                          </Button>
+                        )}
+                        <Button
+                          size="small"
+                          color="error"
+                          startIcon={<UndoOutlinedIcon />}
+                          disabled={!relatedFlag || relatedFlag.status === 'rolled-back'}
+                          onClick={() => {
+                            setSelectedFlagId(event.flagId)
+                            setReason('生产异常触发人工回滚，停止继续放量。')
+                          }}
+                        >
+                          回滚
+                        </Button>
+                      </Stack>
                     </TableCell>
                   </TableRow>
                 )
@@ -168,6 +202,71 @@ export function AuditPage() {
           </Table>
         </TableContainer>
       </Card>
+
+      <Dialog open={Boolean(detailEvent)} onClose={() => setDetailEvent(null)} fullWidth maxWidth="md">
+        <DialogTitle>
+          字段级变更明细
+          {detailEvent?.conflictResolved && (
+            <Chip size="small" color="warning" variant="outlined" sx={{ ml: 1 }} label="含版本冲突逐项定稿" />
+          )}
+        </DialogTitle>
+        <DialogContent dividers>
+          {detailEvent && (
+            <>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                {detailEvent.flagKey} · {detailEvent.actor} · {detailEvent.createdAt.slice(0, 16).replace('T', ' ')}
+                {detailEvent.fromVersion && ` · v${detailEvent.fromVersion} → v${detailEvent.toVersion}`}
+                {detailEvent.commitId && ` · 提交编号 ${detailEvent.commitId.slice(0, 8)}`}
+              </Typography>
+              {detailEvent.fieldChanges?.map((change) => (
+                <Box key={change.field} className="audit-field-detail" sx={{ mb: 2 }}>
+                  <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.5 }}>
+                    <Typography fontWeight={700}>{change.fieldLabel}</Typography>
+                    {change.resolution && (
+                      <Chip size="small" color="warning" variant="outlined" label={`冲突定稿：${resolutionLabel[change.resolution]}${change.resolvedBy ? ` · ${change.resolvedBy}` : ''}`} />
+                    )}
+                  </Stack>
+                  {change.resolution ? (
+                    <Box className="conflict-audit-grid">
+                      <Box>
+                        <Typography variant="caption" color="text.secondary">打开时旧值</Typography>
+                        <Typography variant="body2">{formatFieldValue(change.field, change.baseValue)}</Typography>
+                      </Box>
+                      <Box>
+                        <Typography variant="caption" color="primary.main">本页修改</Typography>
+                        <Typography variant="body2">{formatFieldValue(change.field, change.requestedValue)}</Typography>
+                      </Box>
+                      <Box>
+                        <Typography variant="caption" color="warning.main">对端已保存</Typography>
+                        <Typography variant="body2">{formatFieldValue(change.field, change.oldValue)}</Typography>
+                      </Box>
+                      <Box>
+                        <Typography variant="caption" color="success.main">最终定稿</Typography>
+                        <Typography variant="body2" fontWeight={700}>{formatFieldValue(change.field, change.newValue)}</Typography>
+                      </Box>
+                    </Box>
+                  ) : (
+                    <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+                      <Box sx={{ flex: 1 }}>
+                        <Typography variant="caption" color="text.secondary">旧值</Typography>
+                        <Typography variant="body2" className="audit-old-value">{formatFieldValue(change.field, change.oldValue)}</Typography>
+                      </Box>
+                      <Box sx={{ flex: 1 }}>
+                        <Typography variant="caption" color="success.main">新值</Typography>
+                        <Typography variant="body2" fontWeight={700}>{formatFieldValue(change.field, change.newValue)}</Typography>
+                      </Box>
+                    </Stack>
+                  )}
+                  <Divider sx={{ mt: 1.5 }} />
+                </Box>
+              ))}
+            </>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDetailEvent(null)}>关闭</Button>
+        </DialogActions>
+      </Dialog>
 
       <Dialog open={Boolean(selectedFlag)} onClose={() => setSelectedFlagId('')} fullWidth maxWidth="sm">
         <DialogTitle>回滚 {selectedFlag?.name}</DialogTitle>

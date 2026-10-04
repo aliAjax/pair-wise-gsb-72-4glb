@@ -21,6 +21,7 @@ import TimelineOutlinedIcon from '@mui/icons-material/TimelineOutlined'
 import HistoryOutlinedIcon from '@mui/icons-material/HistoryOutlined'
 import AssessmentOutlinedIcon from '@mui/icons-material/AssessmentOutlined'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { PendingCommitsBanner } from '@/components/PendingCommitsBanner'
 
 const drawerWidth = 224
 
@@ -157,6 +158,7 @@ export function AppLayout({ children }: { children?: ReactNode }) {
       </Drawer>
 
       <Box component="main" className="main-content" sx={{ ml: { lg: `${drawerWidth}px` } }}>
+        <PendingCommitsBanner />
         {children ?? <Outlet />}
       </Box>
     </Box>

@@ -22,8 +22,10 @@ import {
 import PlayArrowOutlinedIcon from '@mui/icons-material/PlayArrowOutlined'
 import UndoOutlinedIcon from '@mui/icons-material/UndoOutlined'
 import PauseCircleOutlineIcon from '@mui/icons-material/PauseCircleOutline'
-import { useGetFlagsQuery, useRollbackFlagMutation, useSaveFlagMutation } from '@/services/flagApi'
+import { useGetFlagsQuery, useRollbackFlagMutation } from '@/services/flagApi'
+import { useVersionedSave } from '@/services/useVersionedSave'
 import { FlagStatusChip } from '@/components/FlagStatusChip'
+import { Link } from 'react-router-dom'
 
 export function RolloutPage() {
   const { data: flags = [], isLoading } = useGetFlagsQuery({})
@@ -31,8 +33,8 @@ export function RolloutPage() {
   const [rollbackOpen, setRollbackOpen] = useState(false)
   const [reason, setReason] = useState('')
   const [message, setMessage] = useState('')
-  const [saveFlag, saveState] = useSaveFlagMutation()
   const [rollbackFlag, rollbackState] = useRollbackFlagMutation()
+  const { pending, isSaving, startSave, retry } = useVersionedSave(selectedId || 'none')
 
   useEffect(() => {
     if (!selectedId && flags.length > 0) setSelectedId(flags[0].id)
@@ -40,6 +42,25 @@ export function RolloutPage() {
 
   const flag = flags.find((item) => item.id === selectedId)
   const currentStepIndex = flag?.rolloutSteps.findIndex((step) => step.status === 'running') ?? -1
+
+  const runVersionedSave = async (desired: typeof flag): Promise<boolean> => {
+    if (!flag || !desired) return false
+    const result = await startSave({
+      desired: { ...desired, lastChangedBy: '林默' },
+      expectedVersion: flag.version,
+      base: flag,
+      intent: 'save-draft',
+    })
+    if (!result) {
+      setMessage('保存失败，本地存储可能暂时不可用，可重试同一笔提交，不会出现半套配置。')
+      return false
+    }
+    if (result.outcome === 'conflict') {
+      setMessage(`检测到版本冲突：${result.conflicts.map((item) => item.fieldLabel).join('、')} 已被其他标签页修改，请在编辑器中逐项定稿。`)
+      return false
+    }
+    return true
+  }
 
   const advanceRollout = async () => {
     if (!flag) return
@@ -54,36 +75,26 @@ export function RolloutPage() {
     }))
     const nextPercentage =
       steps.find((step) => step.status === 'running')?.percentage ?? flag.rolloutPercentage
-    try {
-      await saveFlag({
-        ...flag,
-        rolloutSteps: steps,
-        rolloutPercentage: nextPercentage,
-        enabled: true,
-        status: 'active',
-        lastChangedBy: '林默',
-      }).unwrap()
-      setMessage(`灰度已推进至 ${nextPercentage}%，新的回滚边界已保存`)
-    } catch {
-      setMessage('推进失败，请检查配置后重试')
-    }
+    const ok = await runVersionedSave({
+      ...flag,
+      rolloutSteps: steps,
+      rolloutPercentage: nextPercentage,
+      enabled: true,
+      status: 'active',
+    })
+    if (ok) setMessage(`灰度已推进至 ${nextPercentage}%，新的回滚边界已按版本校验保存`)
   }
 
   const pauseRollout = async () => {
     if (!flag) return
-    try {
-      await saveFlag({
-        ...flag,
-        status: 'frozen',
-        lastChangedBy: '林默',
-        rolloutSteps: flag.rolloutSteps.map((step) =>
-          step.status === 'running' ? { ...step, status: 'paused' } : step,
-        ),
-      }).unwrap()
-      setMessage('灰度流量已冻结，现有用户继续使用当前配置')
-    } catch {
-      setMessage('冻结失败，请重试')
-    }
+    const ok = await runVersionedSave({
+      ...flag,
+      status: 'frozen',
+      rolloutSteps: flag.rolloutSteps.map((step) =>
+        step.status === 'running' ? { ...step, status: 'paused' } : step,
+      ),
+    })
+    if (ok) setMessage('灰度流量已冻结，现有用户继续使用当前配置')
   }
 
   const submitRollback = async () => {
@@ -121,7 +132,23 @@ export function RolloutPage() {
         </TextField>
       </Box>
 
-      {message && <Alert severity={message.includes('失败') ? 'error' : 'success'} onClose={() => setMessage('')} sx={{ mb: 2 }}>{message}</Alert>}
+      {message && <Alert severity={message.includes('失败') || message.includes('冲突') ? 'error' : 'success'} onClose={() => setMessage('')} sx={{ mb: 2 }}>{message}</Alert>}
+      {pending && (
+        <Alert severity={pending.conflict ? 'warning' : pending.lastError ? 'error' : 'info'} sx={{ mb: 2 }}>
+          {pending.conflict
+            ? `该开关有一笔保存因版本冲突挂起（${pending.conflict.conflicts.length} 个字段待定稿）：`
+            : `该开关有一笔保存尚未完成（提交编号 ${pending.commitId.slice(0, 8)}，已尝试 ${pending.attempts} 次）：`}
+          {pending.conflict ? (
+            <Button component={Link} size="small" to={`/flags/${pending.flagId}`} variant="contained" color="warning" sx={{ ml: 1 }}>
+              前往编辑器逐项定稿
+            </Button>
+          ) : (
+            <Button size="small" variant="contained" loading={isSaving} onClick={() => void retry()} sx={{ ml: 1 }}>
+              重试同一笔提交
+            </Button>
+          )}
+        </Alert>
+      )}
       {isLoading && <LinearProgress sx={{ mb: 2 }} />}
 
       {flag && (
@@ -137,10 +164,10 @@ export function RolloutPage() {
                   <Typography variant="caption" color="text.secondary">{flag.key} · 当前 {flag.rolloutPercentage}%</Typography>
                 </Box>
                 <Stack direction="row" spacing={1}>
-                  <Button variant="outlined" startIcon={<PauseCircleOutlineIcon />} onClick={() => void pauseRollout()} disabled={saveState.isLoading || flag.status === 'frozen'}>
+                  <Button variant="outlined" startIcon={<PauseCircleOutlineIcon />} onClick={() => void pauseRollout()} disabled={isSaving || flag.status === 'frozen'}>
                     冻结流量
                   </Button>
-                  <Button variant="contained" startIcon={<PlayArrowOutlinedIcon />} onClick={() => void advanceRollout()} disabled={saveState.isLoading || currentStepIndex < 0 || currentStepIndex >= flag.rolloutSteps.length - 1}>
+                  <Button variant="contained" startIcon={<PlayArrowOutlinedIcon />} onClick={() => void advanceRollout()} disabled={isSaving || currentStepIndex < 0 || currentStepIndex >= flag.rolloutSteps.length - 1}>
                     推进下一阶段
                   </Button>
                   <Button color="error" variant="outlined" startIcon={<UndoOutlinedIcon />} onClick={() => setRollbackOpen(true)}>

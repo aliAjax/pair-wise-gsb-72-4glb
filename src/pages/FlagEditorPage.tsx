@@ -24,11 +24,24 @@ import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline'
 import SaveOutlinedIcon from '@mui/icons-material/SaveOutlined'
 import SendOutlinedIcon from '@mui/icons-material/SendOutlined'
 import ArrowBackIcon from '@mui/icons-material/ArrowBack'
+import PendingActionsIcon from '@mui/icons-material/PendingActions'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { useGetAuditQuery, useGetFlagQuery, useGetFlagsQuery, useSaveFlagMutation, useSubmitForReviewMutation } from '@/services/flagApi'
+import { useGetAuditQuery, useGetFlagQuery, useGetFlagsQuery } from '@/services/flagApi'
+import { useVersionedSave } from '@/services/useVersionedSave'
+import { getPendingCommit, listPendingCommits } from '@/services/pendingCommits'
 import { FlagStatusChip } from '@/components/FlagStatusChip'
 import { DependencyGraph } from '@/components/DependencyGraph'
-import type { AudienceRule, Dependency, FeatureFlag, RuleOperator, RolloutStep } from '@/types'
+import { ConflictResolutionDialog } from '@/components/ConflictResolutionDialog'
+import { FIELD_LABELS } from '@/services/flagFields'
+import type {
+  AudienceRule,
+  ConflictResolutionChoice,
+  EditableFlagField,
+  FeatureFlag,
+  RuleOperator,
+  RolloutStep,
+  SaveFlagResult,
+} from '@/types'
 
 const now = new Date().toISOString()
 
@@ -54,6 +67,10 @@ const emptyFlag = (): FeatureFlag => ({
   createdAt: now,
   updatedAt: now,
   lastChangedBy: '林默',
+  version: 1,
+  versionHistory: [
+    { version: 1, updatedAt: now, actor: '林默', note: '新建草稿' },
+  ],
 })
 
 const operators: Array<{ value: RuleOperator; label: string }> = [
@@ -71,19 +88,70 @@ export function FlagEditorPage() {
   const navigate = useNavigate()
   const [tab, setTab] = useState(0)
   const [draft, setDraft] = useState<FeatureFlag>(emptyFlag)
+  /** 打开页面 / 最近一次成功保存时记录的版本快照，提交前据此做乐观锁校验。 */
+  const [base, setBase] = useState<FeatureFlag | null>(null)
   const [errors, setErrors] = useState<string[]>([])
-  const [savedFlag, setSavedFlag] = useState<FeatureFlag | null>(null)
   const [metricInput, setMetricInput] = useState('')
+  const [conflictOpen, setConflictOpen] = useState(false)
+  const [notice, setNotice] = useState('')
   const { data: existing, isLoading } = useGetFlagQuery(id ?? '', { skip: isNew })
   const { data: allFlags = [] } = useGetFlagsQuery({})
   const { data: audit = [] } = useGetAuditQuery({ flagId: id ?? '' }, { skip: isNew })
-  const [saveFlag, saveState] = useSaveFlagMutation()
-  const [submitReview, submitState] = useSubmitForReviewMutation()
-  const activeFlag = savedFlag ?? draft
+  const {
+    pending,
+    isSaving,
+    autoMergedNotice,
+    startSave,
+    resolveConflict,
+    retry,
+    discard,
+    dismissAutoMergedNotice,
+  } = useVersionedSave(draft.id)
+  const activeFlag = draft
+  const hasConflict = Boolean(pending?.conflict)
 
   useEffect(() => {
-    if (existing) setDraft(existing)
+    if (existing) {
+      const resumed = getPendingCommit(existing.id)
+      if (resumed) {
+        // 重新打开接着完成同一笔提交：恢复当时的草稿和打开时基线，而不是用最新值覆盖。
+        setDraft(resumed.desired)
+        setBase(resumed.base ?? existing)
+        setConflictOpen(Boolean(resumed.conflict))
+      } else {
+        setDraft(existing)
+        setBase(existing)
+      }
+    }
+    // 挂起记录在挂载时从持久化存储恢复，这里只以服务端数据为触发。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [existing])
+
+  useEffect(() => {
+    if (!isNew) return
+    // 新建过程中刷新：从挂起存储找回尚未落库的同一笔草稿。
+    const orphan = listPendingCommits()
+      .filter((item) => item.expectedVersion === 0)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]
+    if (orphan) {
+      setDraft(orphan.desired)
+      setBase(null)
+      setConflictOpen(Boolean(orphan.conflict))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isNew])
+
+  useEffect(() => {
+    setConflictOpen(Boolean(pending?.conflict))
+  }, [pending?.conflict])
+
+  useEffect(() => {
+    if (autoMergedNotice.length > 0) {
+      setNotice(`对方在其他标签页保存的以下字段已自动并入本笔提交：${autoMergedNotice
+        .map((field) => FIELD_LABELS[field as EditableFlagField])
+        .join('、')}`)
+    }
+  }, [autoMergedNotice])
 
   const availableDependencies = useMemo(
     () => allFlags.filter((flag) => flag.id !== activeFlag.id),
@@ -113,28 +181,65 @@ export function FlagEditorPage() {
     return nextErrors.length === 0
   }
 
-  const persist = async () => {
-    if (!validate()) return null
-    try {
-      const result = await saveFlag({ ...draft, updatedAt: new Date().toISOString() }).unwrap()
-      setSavedFlag(result)
-      setDraft(result)
-      if (isNew) navigate(`/flags/${result.id}`, { replace: true })
-      return result
-    } catch {
-      setErrors(['保存失败，请检查本地存储权限后重试'])
-      return null
+  const handleSaveResult = (result: SaveFlagResult | undefined, intent: 'save-draft' | 'submit-review') => {
+    if (!result) {
+      setErrors([
+        pending?.lastError ??
+          '保存失败，本地存储可能暂时不可用；可点击“重试”继续同一笔提交，不会产生半套配置。',
+      ])
+      return
+    }
+    if (result.outcome === 'conflict') {
+      setErrors([])
+      setConflictOpen(true)
+      return
+    }
+    setErrors([])
+    setDraft(result.flag)
+    setBase(result.flag)
+    if (isNew) navigate(`/flags/${result.flag.id}`, { replace: true })
+    if (intent === 'submit-review') navigate('/review')
+  }
+
+  const persist = async (intent: 'save-draft' | 'submit-review') => {
+    if (!validate()) return
+    const expectedVersion = isNew ? 0 : base?.version ?? draft.version
+    const desired: FeatureFlag = {
+      ...draft,
+      status: intent === 'submit-review' ? 'review' : draft.status,
+    }
+    const result = await startSave({
+      desired,
+      expectedVersion,
+      base: isNew ? undefined : (base ?? draft),
+      intent,
+    })
+    handleSaveResult(result, intent)
+  }
+
+  const handleResolve = async (
+    resolutions: Partial<Record<EditableFlagField, ConflictResolutionChoice>>,
+    reviewer: string,
+  ) => {
+    const result = await resolveConflict(resolutions, reviewer)
+    if (result && result.outcome === 'success') {
+      setConflictOpen(false)
+      setDraft(result.flag)
+      setBase(result.flag)
+      setNotice(`v${result.flag.version} 已按逐项定稿保存，冲突旧值已写入审计记录。`)
+      if (pending?.intent === 'submit-review') navigate('/review')
+    } else if (result && result.outcome === 'conflict') {
+      setNotice('定稿期间版本又前进了一步，已重新列出最新冲突，请再次逐项确认。')
     }
   }
 
-  const handleSubmit = async () => {
-    const saved = await persist()
-    if (!saved) return
-    try {
-      await submitReview({ id: saved.id, actor: saved.lastChangedBy }).unwrap()
-      navigate('/review')
-    } catch {
-      setErrors(['提交评审失败，请稍后重试'])
+  const handleRetry = async () => {
+    const result = await retry()
+    if (result && result.outcome === 'success') {
+      setDraft(result.flag)
+      setBase(result.flag)
+      if (isNew) navigate(`/flags/${result.flag.id}`, { replace: true })
+      if (pending?.intent === 'submit-review') navigate('/review')
     }
   }
 
@@ -163,7 +268,7 @@ export function FlagEditorPage() {
     ])
   }
 
-  const updateDependency = (index: number, patch: Partial<Dependency>) => {
+  const updateDependency = (index: number, patch: Partial<FeatureFlag['dependencies'][number]>) => {
     update(
       'dependencies',
       draft.dependencies.map((dependency, itemIndex) =>
@@ -195,6 +300,9 @@ export function FlagEditorPage() {
           <Stack direction="row" spacing={1.2} alignItems="center">
             <Typography variant="h2">{isNew ? '创建功能开关' : activeFlag.name || '未命名开关'}</Typography>
             <FlagStatusChip status={activeFlag.status} />
+            {!isNew && (
+              <Chip size="small" variant="outlined" label={`版本 v${base?.version ?? draft.version}`} />
+            )}
           </Stack>
           <Typography color="text.secondary">
             {activeFlag.key || '尚未设置 Key'} · 最近更新 {activeFlag.updatedAt.slice(0, 16).replace('T', ' ')}
@@ -207,21 +315,76 @@ export function FlagEditorPage() {
           <Button
             variant="outlined"
             startIcon={<SaveOutlinedIcon />}
-            loading={saveState.isLoading}
-            onClick={() => void persist()}
+            loading={isSaving}
+            disabled={hasConflict}
+            onClick={() => void persist('save-draft')}
           >
             保存草稿
           </Button>
           <Button
             variant="contained"
             startIcon={<SendOutlinedIcon />}
-            loading={submitState.isLoading}
-            onClick={() => void handleSubmit()}
+            loading={isSaving}
+            disabled={hasConflict}
+            onClick={() => void persist('submit-review')}
           >
             提交影响评审
           </Button>
         </Stack>
       </Box>
+
+      {pending && (
+        <Alert
+          severity={pending.conflict ? 'warning' : pending.lastError ? 'error' : 'info'}
+          icon={<PendingActionsIcon />}
+          sx={{ mb: 2 }}
+        >
+          <Typography variant="body2" fontWeight={700}>
+            {pending.intent === 'submit-review' ? '有一笔提交评审' : '有一笔保存'}未完成（编号 {pending.commitId.slice(0, 8)}，已尝试 {pending.attempts} 次）
+          </Typography>
+          <Typography variant="caption" display="block">
+            基于打开时的 v{pending.expectedVersion} · 最近尝试 {pending.lastAttemptAt.slice(0, 16).replace('T', ' ')}
+            {pending.conflict
+              ? ` · 对端已保存到 v${pending.conflict.currentVersion}，${pending.conflict.conflicts.length} 个字段冲突待逐项定稿`
+              : pending.lastError
+                ? ` · ${pending.lastError}`
+                : ' · 正在保存…'}
+          </Typography>
+          <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
+            {pending.conflict ? (
+              <Button size="small" variant="contained" color="warning" onClick={() => setConflictOpen(true)}>
+                继续逐项定稿
+              </Button>
+            ) : (
+              <Button size="small" variant="contained" loading={isSaving} onClick={() => void handleRetry()}>
+                重试同一笔提交
+              </Button>
+            )}
+            <Button
+              size="small"
+              color="inherit"
+              onClick={() => {
+                discard()
+                setConflictOpen(false)
+              }}
+            >
+              放弃该提交
+            </Button>
+          </Stack>
+        </Alert>
+      )}
+
+      {notice && (
+        <Alert severity="info" sx={{ mb: 2 }} onClose={() => setNotice('')}>
+          {notice}
+        </Alert>
+      )}
+      {autoMergedNotice.length > 0 && (
+        <Alert severity="info" sx={{ mb: 2 }} onClose={dismissAutoMergedNotice}>
+          {notice ? '' : '对方在其他标签页的修改已自动并入：'}
+          {autoMergedNotice.map((field) => FIELD_LABELS[field]).join('、')}
+        </Alert>
+      )}
 
       {errors.length > 0 && (
         <Alert severity="error" onClose={() => setErrors([])} sx={{ mb: 2 }}>
@@ -391,7 +554,7 @@ export function FlagEditorPage() {
                     select
                     label="关系类型"
                     value={dependency.type}
-                    onChange={(event) => updateDependency(index, { type: event.target.value as Dependency['type'] })}
+                    onChange={(event) => updateDependency(index, { type: event.target.value as FeatureFlag['dependencies'][number]['type'] })}
                   >
                     <MenuItem value="requires">前置依赖</MenuItem>
                     <MenuItem value="conflicts">互斥冲突</MenuItem>
@@ -528,7 +691,12 @@ export function FlagEditorPage() {
                 <Box className="audit-event" key={event.id}>
                   <Box className="audit-dot" />
                   <Box>
-                    <Typography variant="body2" fontWeight={700}>{event.summary}</Typography>
+                    <Typography variant="body2" fontWeight={700}>
+                      {event.summary}
+                      {event.fromVersion && (
+                        <Chip size="small" variant="outlined" sx={{ ml: 1 }} label={`v${event.fromVersion} → v${event.toVersion}`} />
+                      )}
+                    </Typography>
                     <Typography variant="caption" color="text.secondary">
                       {event.actor} · {event.createdAt.slice(0, 16).replace('T', ' ')}
                     </Typography>
@@ -536,6 +704,16 @@ export function FlagEditorPage() {
                       <Typography variant="caption" display="block" color="text.secondary">
                         {event.before || '-'} → {event.after || '-'}
                       </Typography>
+                    )}
+                    {event.fieldChanges && event.fieldChanges.length > 0 && (
+                      <Box sx={{ mt: 0.5 }}>
+                        {event.fieldChanges.map((change) => (
+                          <Typography key={change.field} variant="caption" display="block" color="text.secondary">
+                            · {change.fieldLabel}：旧值已留存
+                            {change.resolution ? `（冲突定稿：${change.resolution === 'mine' ? '采用本页修改' : change.resolution === 'theirs' ? '采用对端已保存' : '保留旧值'}${change.resolvedBy ? `，定稿人 ${change.resolvedBy}` : ''}）` : ''}
+                          </Typography>
+                        ))}
+                      </Box>
                     )}
                   </Box>
                 </Box>
@@ -545,6 +723,17 @@ export function FlagEditorPage() {
           </CardContent>
         )}
       </Card>
+
+      <ConflictResolutionDialog
+        open={conflictOpen}
+        conflicts={pending?.conflict?.conflicts ?? []}
+        expectedVersion={pending?.expectedVersion ?? base?.version ?? 0}
+        currentVersion={pending?.conflict?.currentVersion ?? 0}
+        autoMergedFields={pending?.conflict?.autoMergedFields ?? []}
+        saving={isSaving}
+        onResolve={(resolutions, reviewer) => void handleResolve(resolutions, reviewer)}
+        onClose={() => setConflictOpen(false)}
+      />
     </Box>
   )
 }

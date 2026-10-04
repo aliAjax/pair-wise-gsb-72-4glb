@@ -1,12 +1,33 @@
 import type {
   AuditEvent,
+  AuditFieldChange,
   DashboardData,
+  EditableFlagField,
   FeatureFlag,
+  FieldConflict,
   ImpactIssue,
   ReviewPayload,
+  SaveFlagRequest,
+  SaveFlagResult,
+  VersionRecord,
 } from '@/types'
+import { EDITABLE_FIELDS, fieldLabel, getFieldValue, deepEqual } from '@/services/flagFields'
 
 const STORAGE_KEY = 'feature-flag-release-console-v1'
+
+/** 本地存储不可用（隐私模式、配额、短暂 IO 失败）时抛出，调用方应允许重试。 */
+export class StorageUnavailableError extends Error {
+  constructor(message = '本地存储暂时不可用，请稍后重试') {
+    super(message)
+    this.name = 'StorageUnavailableError'
+  }
+}
+
+/** 提交被业务规则拒绝（开关不存在等），重试无意义。 */
+export class CommitRejectedError extends Error {}
+
+/** 历史数据结构：升级前的开关没有版本字段。 */
+type LegacyFeatureFlag = Omit<FeatureFlag, 'version' | 'versionHistory' | 'lastCommitId'>
 
 export interface Database {
   flags: FeatureFlag[]
@@ -14,7 +35,7 @@ export interface Database {
   issues: ImpactIssue[]
 }
 
-const flags: FeatureFlag[] = [
+const flags: LegacyFeatureFlag[] = [
   {
     id: 'flag-101',
     key: 'checkout.express-pay-v2',
@@ -367,7 +388,50 @@ const audit: AuditEvent[] = [
   },
 ]
 
-export const seedDatabase = (): Database => ({ flags, audit, issues })
+export const seedDatabase = (): Database => ({
+  flags: flags.map(migrateLegacyFlag),
+  audit,
+  issues,
+})
+
+let uidCounter = 0
+const uid = (prefix: string): string => {
+  uidCounter += 1
+  return `${prefix}-${Date.now().toString(36)}-${uidCounter}-${Math.random().toString(36).slice(2, 7)}`
+}
+
+/** 升级读取：没有版本号的历史开关，按原更新时间补建初始版本。 */
+const migrateLegacyFlag = (flag: FeatureFlag | LegacyFeatureFlag): FeatureFlag => {
+  if ('version' in flag && Number.isInteger(flag.version) && flag.version > 0) {
+    if (flag.versionHistory && flag.versionHistory.length > 0) return flag
+    return {
+      ...flag,
+      versionHistory: [
+        {
+          version: 1,
+          updatedAt: flag.updatedAt,
+          actor: flag.lastChangedBy,
+          note: '按原更新时间补建的初始版本',
+        },
+      ],
+    }
+  }
+  const history: VersionRecord[] = [
+    {
+      version: 1,
+      updatedAt: flag.updatedAt,
+      actor: flag.lastChangedBy,
+      note: '按原更新时间补建的初始版本',
+    },
+  ]
+  return { ...(flag as LegacyFeatureFlag), version: 1, versionHistory: history }
+}
+
+interface StoredDatabase {
+  flags?: Array<FeatureFlag | LegacyFeatureFlag>
+  audit?: AuditEvent[]
+  issues?: ImpactIssue[]
+}
 
 export const readDatabase = (): Database => {
   const raw = localStorage.getItem(STORAGE_KEY)
@@ -376,74 +440,512 @@ export const readDatabase = (): Database => {
     writeDatabase(seed)
     return seed
   }
+  let parsed: StoredDatabase
   try {
-    return JSON.parse(raw) as Database
+    parsed = JSON.parse(raw) as StoredDatabase
   } catch {
     const seed = seedDatabase()
     writeDatabase(seed)
     return seed
   }
+  let migrated = false
+  const nextFlags = (parsed.flags ?? []).map((flag) => {
+    const needsVersion =
+      !('version' in flag) || !Number.isInteger((flag as FeatureFlag).version) || (flag as FeatureFlag).version < 1
+    const needsHistory =
+      !('versionHistory' in flag) ||
+      !Array.isArray((flag as FeatureFlag).versionHistory) ||
+      (flag as FeatureFlag).versionHistory.length === 0
+    if (needsVersion || needsHistory) {
+      migrated = true
+      return migrateLegacyFlag(flag)
+    }
+    return flag as FeatureFlag
+  })
+  const database: Database = {
+    flags: nextFlags,
+    audit: parsed.audit ?? [],
+    issues: parsed.issues ?? [],
+  }
+  // 补建结果尽力回写；回写失败不影响本次读取，历史审计记录原样保留。
+  if (migrated) {
+    try {
+      writeDatabase(database)
+    } catch {
+      // 忽略：下次读取仍会再次补建。
+    }
+  }
+  return database
 }
 
+/** 唯一落库入口：一次 setItem 写入完整数据库，任何异常都不会留下半套配置。 */
 export const writeDatabase = (database: Database): void => {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(database))
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(database))
+  } catch (error) {
+    throw new StorageUnavailableError(
+      error instanceof Error ? error.message : '本地存储写入失败，请稍后重试',
+    )
+  }
 }
+
+const pushAudit = (db: Database, event: Omit<AuditEvent, 'id' | 'createdAt'>): AuditEvent => {
+  const full: AuditEvent = { ...event, id: uid('audit'), createdAt: new Date().toISOString() }
+  db.audit.unshift(full)
+  return full
+}
+
+const advanceVersion = (
+  flag: FeatureFlag,
+  actor: string,
+  commitId: string | undefined,
+  note?: string,
+): FeatureFlag => ({
+  ...flag,
+  version: flag.version + 1,
+  versionHistory: [
+    ...flag.versionHistory,
+    { version: flag.version + 1, updatedAt: new Date().toISOString(), actor, commitId, note },
+  ],
+})
+
+const affectedUsersOf = (percentage: number): number => Math.round(900000 * (percentage / 100))
+
+interface ResolvedConflict {
+  field: EditableFlagField
+  resolution: NonNullable<SaveFlagRequest['resolutions']>[EditableFlagField]
+  baseValue: unknown
+  requestedValue: unknown
+  currentValue: unknown
+}
+
+interface MergeOutcome {
+  merged: Partial<FeatureFlag>
+  conflicts: FieldConflict[]
+  autoMergedFields: EditableFlagField[]
+  resolvedConflicts: ResolvedConflict[]
+}
+
+/**
+ * 三方合并：base 为打开页面时的版本，requested 为本页修改，current 为库中最新版本。
+ * 仅一方修改的字段自动收敛；双方都改且不同值的字段进入冲突列表，由评审人逐项定稿。
+ */
+const mergeFields = (
+  base: FeatureFlag,
+  requested: FeatureFlag,
+  current: FeatureFlag,
+  saveRequest: SaveFlagRequest,
+): MergeOutcome => {
+  const mergedRecord: Record<string, unknown> = {}
+  const conflicts: FieldConflict[] = []
+  const autoMergedFields: EditableFlagField[] = []
+  const resolvedConflicts: ResolvedConflict[] = []
+  // 提交评审时状态由意图决定，不参与字段冲突；保存草稿时状态照常比对。
+  const fields =
+    saveRequest.intent === 'submit-review'
+      ? EDITABLE_FIELDS.filter((field) => field !== 'status')
+      : EDITABLE_FIELDS
+
+  // 定稿只在版本与定稿时所依据的版本一致时有效，避免旧决定覆盖更新的对端值。
+  const resolutionsHonored =
+    saveRequest.resolvedAgainstVersion === undefined ||
+    saveRequest.resolvedAgainstVersion === current.version
+
+  for (const field of fields) {
+    const baseValue = getFieldValue(base, field)
+    const requestedValue = getFieldValue(requested, field)
+    const currentValue = getFieldValue(current, field)
+    const mineChanged = !deepEqual(requestedValue, baseValue)
+    const theirsChanged = !deepEqual(currentValue, baseValue)
+
+    if (!mineChanged && !theirsChanged) {
+      mergedRecord[field] = currentValue
+      continue
+    }
+    if (mineChanged && !theirsChanged) {
+      mergedRecord[field] = requestedValue
+      continue
+    }
+    if (!mineChanged && theirsChanged) {
+      mergedRecord[field] = currentValue
+      autoMergedFields.push(field)
+      continue
+    }
+    // 双方都改：值一致视为一致收敛。
+    if (deepEqual(requestedValue, currentValue)) {
+      mergedRecord[field] = requestedValue
+      continue
+    }
+    const resolution = resolutionsHonored ? saveRequest.resolutions?.[field] : undefined
+    if (resolution) {
+      mergedRecord[field] =
+        resolution === 'mine'
+          ? requestedValue
+          : resolution === 'theirs'
+            ? currentValue
+            : baseValue
+      resolvedConflicts.push({
+        field,
+        resolution,
+        baseValue,
+        requestedValue,
+        currentValue,
+      })
+      continue
+    }
+    conflicts.push({ field, fieldLabel: fieldLabel(field), baseValue, requestedValue, currentValue })
+  }
+
+  return { merged: mergedRecord as Partial<FeatureFlag>, conflicts, autoMergedFields, resolvedConflicts }
+}
+
+/**
+ * 按版本校验保存：
+ * - 版本未前进时直接写入；
+ * - 版本已前进时做三方合并，冲突字段逐项列出，未定稿则不落库；
+ * - 同一 commitId 重试直接幂等返回；
+ * - 成功路径只有一次原子写入。
+ */
+export const commitFlagSave = (request: SaveFlagRequest): SaveFlagResult => {
+  const db = readDatabase()
+  const { flag: requested, expectedVersion, intent, commitId, resolvedBy } = request
+  const index = db.flags.findIndex((item) => item.id === requested.id)
+  const now = new Date().toISOString()
+
+  if (index < 0) {
+    if (expectedVersion !== 0) {
+      throw new CommitRejectedError('功能开关不存在或已被删除')
+    }
+    const created: FeatureFlag = {
+      ...requested,
+      status: intent === 'submit-review' ? 'review' : requested.status,
+      updatedAt: now,
+      version: 1,
+      versionHistory: [
+        {
+          version: 1,
+          updatedAt: now,
+          actor: requested.lastChangedBy,
+          commitId,
+          note: intent === 'submit-review' ? '创建并提交影响评审' : '创建草稿',
+        },
+      ],
+      lastCommitId: commitId,
+    }
+    db.flags.unshift(created)
+    pushAudit(db, {
+      flagId: created.id,
+      flagKey: created.key,
+      action: intent === 'submit-review' ? 'submitted' : 'created',
+      actor: created.lastChangedBy,
+      summary:
+        intent === 'submit-review'
+          ? `创建开关并提交影响评审（提交编号 ${commitId.slice(0, 8)}）。`
+          : `创建功能开关草稿（提交编号 ${commitId.slice(0, 8)}）。`,
+      before: undefined,
+      after: `v1 · ${created.status}`,
+      affectedUsers: affectedUsersOf(created.rolloutPercentage),
+      commitId,
+      toVersion: 1,
+    })
+    writeDatabase(db)
+    return { outcome: 'success', flag: created, autoMergedFields: [] }
+  }
+
+  const current = db.flags[index]
+
+  // 刷新或重复点击后的幂等重试：同一笔提交只生效一次。
+  if (current.lastCommitId === commitId) {
+    return { outcome: 'success', flag: current, autoMergedFields: [] }
+  }
+
+  if (current.version === expectedVersion) {
+    const finalFlag = applyIntent(
+      {
+        ...current,
+        ...pickEditable(requested),
+        key: requested.key,
+      },
+      intent,
+    )
+    const saved = finalizeFlag(db, {
+      current,
+      finalFlag,
+      intent,
+      commitId,
+      now,
+      fieldChanges: buildFieldChanges(current, finalFlag, [], undefined),
+      autoMergedFields: [],
+      conflictResolved: false,
+      index,
+    })
+    return { outcome: 'success', flag: saved, autoMergedFields: [] }
+  }
+
+  // 版本已前进：以请求携带的打开时快照为基线做三方合并。
+  const base = request.base
+  if (!base || base.version !== expectedVersion) {
+    throw new CommitRejectedError('缺少打开页面时的版本快照，请刷新页面后重试')
+  }
+  const { merged, conflicts, autoMergedFields, resolvedConflicts } = mergeFields(
+    base,
+    requested,
+    current,
+    request,
+  )
+  if (conflicts.length > 0) {
+    // 冲突未定稿：不写入任何数据，页面保持完整的旧版本。
+    return {
+      outcome: 'conflict',
+      flagId: current.id,
+      flagKey: current.key,
+      expectedVersion,
+      currentVersion: current.version,
+      conflicts,
+      autoMergedFields,
+      commitId,
+    }
+  }
+
+  const finalFlag = applyIntent(
+    {
+      ...current,
+      ...merged,
+      key: requested.key,
+    },
+    intent,
+  )
+  const fieldChanges = buildFieldChanges(current, finalFlag, resolvedConflicts, resolvedBy)
+  const saved = finalizeFlag(db, {
+    current,
+    finalFlag,
+    intent,
+    commitId,
+    now,
+    fieldChanges,
+    autoMergedFields,
+    conflictResolved: resolvedConflicts.length > 0,
+    index,
+  })
+  return { outcome: 'success', flag: saved, autoMergedFields }
+}
+
+const pickEditable = (flag: FeatureFlag): Partial<FeatureFlag> => {
+  const result: Partial<FeatureFlag> = {}
+  for (const field of EDITABLE_FIELDS) {
+    ;(result as Record<string, unknown>)[field] = getFieldValue(flag, field)
+  }
+  return result
+}
+
+const applyIntent = (flag: FeatureFlag, intent: SaveFlagRequest['intent']): FeatureFlag =>
+  intent === 'submit-review' ? { ...flag, status: 'review' } : flag
+
+const buildFieldChanges = (
+  current: FeatureFlag,
+  finalFlag: FeatureFlag,
+  resolvedConflicts: ResolvedConflict[],
+  resolvedBy?: string,
+): AuditFieldChange[] => {
+  const changes: AuditFieldChange[] = []
+  for (const field of EDITABLE_FIELDS) {
+    const oldValue = getFieldValue(current, field)
+    const newValue = getFieldValue(finalFlag, field)
+    if (deepEqual(oldValue, newValue)) continue
+    const resolved = resolvedConflicts.find((item) => item.field === field)
+    changes.push({
+      field,
+      fieldLabel: fieldLabel(field),
+      oldValue,
+      newValue,
+      ...(resolved
+        ? {
+            baseValue: resolved.baseValue,
+            requestedValue: resolved.requestedValue,
+            resolution: resolved.resolution,
+            resolvedBy,
+          }
+        : {}),
+    })
+  }
+  return changes
+}
+
+interface FinalizeInput {
+  current: FeatureFlag
+  finalFlag: FeatureFlag
+  intent: SaveFlagRequest['intent']
+  commitId: string
+  now: string
+  fieldChanges: AuditFieldChange[]
+  autoMergedFields: EditableFlagField[]
+  conflictResolved: boolean
+  index: number
+}
+
+const finalizeFlag = (db: Database, input: FinalizeInput): FeatureFlag => {
+  const { current, intent, commitId, now, fieldChanges, autoMergedFields, conflictResolved, index } =
+    input
+  const saved: FeatureFlag = {
+    ...input.finalFlag,
+    updatedAt: now,
+    lastChangedBy: input.finalFlag.lastChangedBy,
+    version: current.version + 1,
+    versionHistory: [
+      ...current.versionHistory,
+      {
+        version: current.version + 1,
+        updatedAt: now,
+        actor: input.finalFlag.lastChangedBy,
+        commitId,
+        note:
+          intent === 'submit-review'
+            ? conflictResolved
+              ? '冲突逐项定稿后提交评审'
+              : '提交影响评审'
+            : conflictResolved
+              ? '冲突逐项定稿后保存'
+              : '保存配置',
+      },
+    ],
+    lastCommitId: commitId,
+  }
+
+  const summaryParts = [
+    intent === 'submit-review' ? '提交影响评审' : '保存配置',
+    `基于 v${current.version} 校验后版本前进至 v${saved.version}`,
+    `变更 ${fieldChanges.length} 个字段`,
+  ]
+  if (autoMergedFields.length > 0) {
+    summaryParts.push(
+      `自动并入对方已保存的 ${autoMergedFields.map(fieldLabel).join('、')}`,
+    )
+  }
+  if (conflictResolved) {
+    summaryParts.push('冲突字段已由评审人逐项定稿，旧值见审计明细')
+  }
+
+  pushAudit(db, {
+    flagId: saved.id,
+    flagKey: saved.key,
+    action: intent === 'submit-review' ? 'submitted' : 'updated',
+    actor: saved.lastChangedBy,
+    summary: `${summaryParts.join('，')}（提交编号 ${commitId.slice(0, 8)}）。`,
+    before: `v${current.version} · ${current.status} · ${current.rolloutPercentage}%`,
+    after: `v${saved.version} · ${saved.status} · ${saved.rolloutPercentage}%`,
+    affectedUsers: affectedUsersOf(saved.rolloutPercentage),
+    fieldChanges,
+    fromVersion: current.version,
+    toVersion: saved.version,
+    conflictResolved,
+    commitId,
+  })
+
+  db.flags[index] = saved
+  writeDatabase(db)
+  return saved
+}
+
+const bumpExistingFlag = (
+  flag: FeatureFlag,
+  actor: string,
+  note: string,
+): FeatureFlag => advanceVersion({ ...flag, updatedAt: new Date().toISOString(), lastChangedBy: actor }, actor, undefined, note)
 
 export const applyReview = (flagId: string, payload: ReviewPayload): FeatureFlag => {
   const db = readDatabase()
-  const flag = db.flags.find((item) => item.id === flagId)
-  if (!flag) throw new Error('功能开关不存在')
+  const index = db.flags.findIndex((item) => item.id === flagId)
+  if (index < 0) throw new Error('功能开关不存在')
+  const flag = db.flags[index]
   const before = flag.status
-  flag.status = payload.decision === 'approved' ? 'active' : 'draft'
-  flag.enabled = payload.decision === 'approved'
-  flag.updatedAt = new Date().toISOString()
-  flag.lastChangedBy = payload.reviewer
-  db.audit.unshift({
-    id: `audit-${Date.now()}`,
+  const reviewed: FeatureFlag = {
+    ...flag,
+    status: payload.decision === 'approved' ? 'active' : 'draft',
+    enabled: payload.decision === 'approved',
+  }
+  if (payload.freezeUntil && payload.decision === 'approved') {
+    reviewed.rollbackConditions = [
+      ...reviewed.rollbackConditions,
+      `冻结至 ${payload.freezeUntil}，期间禁止扩大流量`,
+    ]
+  }
+  const saved = bumpExistingFlag(reviewed, payload.reviewer, payload.decision === 'approved' ? '审批通过' : '审批驳回')
+  db.flags[index] = saved
+  pushAudit(db, {
     flagId,
     flagKey: flag.key,
     action: payload.decision,
     actor: payload.reviewer,
     summary: payload.comment,
-    before,
-    after: flag.status,
-    affectedUsers: Math.round(120000 * (flag.rolloutPercentage / 100)),
-    createdAt: new Date().toISOString(),
+    before: `v${flag.version} · ${before}`,
+    after: `v${saved.version} · ${saved.status}`,
+    affectedUsers: affectedUsersOf(saved.rolloutPercentage),
+    fieldChanges: buildFieldChanges(flag, saved, [], payload.reviewer),
+    fromVersion: flag.version,
+    toVersion: saved.version,
   })
-  if (payload.freezeUntil && payload.decision === 'approved') {
-    flag.rollbackConditions.push(`冻结至 ${payload.freezeUntil}，期间禁止扩大流量`)
-  }
   writeDatabase(db)
-  return flag
+  return saved
 }
 
 export const rollbackFlag = (flagId: string, actor: string, reason: string): FeatureFlag => {
   const db = readDatabase()
-  const flag = db.flags.find((item) => item.id === flagId)
-  if (!flag) throw new Error('功能开关不存在')
-  const before = `${flag.status} / ${flag.rolloutPercentage}%`
-  flag.status = 'rolled-back'
-  flag.enabled = false
-  flag.rolloutPercentage = 0
-  flag.updatedAt = new Date().toISOString()
-  flag.lastChangedBy = actor
-  flag.rolloutSteps.forEach((step) => {
-    if (step.status === 'running') step.status = 'paused'
-  })
-  db.audit.unshift({
-    id: `audit-${Date.now()}`,
+  const index = db.flags.findIndex((item) => item.id === flagId)
+  if (index < 0) throw new Error('功能开关不存在')
+  const flag = db.flags[index]
+  const beforePercentage = flag.rolloutPercentage
+  const before = `${flag.status} / ${beforePercentage}%`
+  const rolledBack: FeatureFlag = {
+    ...flag,
+    status: 'rolled-back',
+    enabled: false,
+    rolloutPercentage: 0,
+    rolloutSteps: flag.rolloutSteps.map((step) =>
+      step.status === 'running' ? { ...step, status: 'paused' } : step,
+    ),
+  }
+  const saved = bumpExistingFlag(rolledBack, actor, '紧急回滚')
+  db.flags[index] = saved
+  pushAudit(db, {
     flagId,
     flagKey: flag.key,
     action: 'rolled-back',
     actor,
     summary: reason,
-    before,
-    after: 'rolled-back / 0%',
-    affectedUsers: Math.round(980000 * (flag.rolloutPercentage / 100)),
-    createdAt: new Date().toISOString(),
+    before: `v${flag.version} · ${before}`,
+    after: `v${saved.version} · rolled-back / 0%`,
+    affectedUsers: affectedUsersOf(beforePercentage),
+    fieldChanges: buildFieldChanges(flag, saved, [], actor),
+    fromVersion: flag.version,
+    toVersion: saved.version,
   })
   writeDatabase(db)
-  return flag
+  return saved
+}
+
+export const submitFlagForReview = (flagId: string, actor: string): FeatureFlag => {
+  const db = readDatabase()
+  const index = db.flags.findIndex((item) => item.id === flagId)
+  if (index < 0) throw new Error('功能开关不存在')
+  const flag = db.flags[index]
+  const submitted: FeatureFlag = { ...flag, status: 'review' }
+  const saved = bumpExistingFlag(submitted, actor, '提交影响评审')
+  db.flags[index] = saved
+  pushAudit(db, {
+    flagId,
+    flagKey: flag.key,
+    action: 'submitted',
+    actor,
+    summary: '提交发布影响评审。',
+    before: `v${flag.version} · ${flag.status}`,
+    after: `v${saved.version} · review`,
+    affectedUsers: affectedUsersOf(saved.rolloutPercentage),
+    fieldChanges: buildFieldChanges(flag, saved, [], actor),
+    fromVersion: flag.version,
+    toVersion: saved.version,
+  })
+  writeDatabase(db)
+  return saved
 }
 
 export const getDashboardStats = (): DashboardData => {

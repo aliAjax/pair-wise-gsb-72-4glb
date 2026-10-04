@@ -770,3 +770,37 @@ a:hover {
     grid-template-columns: minmax(180px, 0.7fr) minmax(120px, 0.7fr) minmax(220px, 1fr);
   }
 }
+
+.conflict-row {
+  gap: 12px;
+  padding: 10px 0;
+}
+
+.conflict-values {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.conflict-value {
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: #f7f8fa;
+  word-break: break-word;
+}
+
+.conflict-audit-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  padding: 8px;
+  border: 1px dashed #ffb65c;
+  border-radius: 6px;
+  background: #fffaf2;
+}
+
+.audit-field-detail .audit-old-value {
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: #f7f8fa;
+  word-break: break-word;
+}
