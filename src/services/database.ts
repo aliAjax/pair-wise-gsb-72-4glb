@@ -12,9 +12,11 @@ export interface Database {
   flags: FeatureFlag[]
   audit: AuditEvent[]
   issues: ImpactIssue[]
+  /** 已成功应用的提交 ID（幂等去重，重试同一笔提交不会重复落库） */
+  appliedCommits?: string[]
 }
 
-const flags: FeatureFlag[] = [
+const flags: Array<Omit<FeatureFlag, 'version' | 'versionedAt'>> = [
   {
     id: 'flag-101',
     key: 'checkout.express-pay-v2',
@@ -367,37 +369,104 @@ const audit: AuditEvent[] = [
   },
 ]
 
-export const seedDatabase = (): Database => ({ flags, audit, issues })
+export const seedDatabase = (): Database => ({
+  // 种子数据视为已完成一次版本化：初始版本 1，版本时间取原 updatedAt
+  flags: flags.map((flag) => ({ ...flag, version: 1, versionedAt: flag.updatedAt })),
+  audit,
+  issues,
+  appliedCommits: [],
+})
+
+/**
+ * 旧数据升级：
+ * - 已存在但缺少版本号的开关，按其原 updatedAt 补建初始版本 v1；
+ * - 不改动任何已有审计记录，保证历史记录原样可查；
+ * - appliedCommits 为去重索引，防止同一笔提交重试时落两份配置。
+ */
+const migrateDatabase = (database: Partial<Database>): Database => {
+  const next: Database = {
+    flags: Array.isArray(database.flags) ? database.flags : [],
+    audit: Array.isArray(database.audit) ? database.audit : [],
+    issues: Array.isArray(database.issues) ? database.issues : [],
+    appliedCommits: Array.isArray(database.appliedCommits) ? database.appliedCommits : [],
+  }
+  let changed = false
+  next.flags = next.flags.map((flag) => {
+    if (typeof flag.version === 'number' && flag.versionedAt) return flag
+    changed = true
+    return { ...flag, version: 1, versionedAt: flag.updatedAt }
+  })
+  if (changed || !Array.isArray(database.appliedCommits)) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next))
+    } catch {
+      // 迁移写入失败时仍返回内存中的升级结果，由调用方重试落盘
+    }
+  }
+  return next
+}
 
 export const readDatabase = (): Database => {
   const raw = localStorage.getItem(STORAGE_KEY)
   if (!raw) {
     const seed = seedDatabase()
-    writeDatabase(seed)
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(seed))
+    } catch {
+      // 本地存储暂不可用，返回内存种子；后续保存会走带重试的持久化
+    }
     return seed
   }
   try {
-    return JSON.parse(raw) as Database
+    return migrateDatabase(JSON.parse(raw) as Partial<Database>)
   } catch {
     const seed = seedDatabase()
-    writeDatabase(seed)
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(seed))
+    } catch {
+      // 同上，忽略存储短暂失败
+    }
     return seed
   }
+}
+
+/** 本地存储短暂失败（隐私模式 / 配额瞬时错误）时退避重试 */
+export const persistDatabase = async (database: Database, attempts = 3): Promise<void> => {
+  let lastError: unknown
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(database))
+      return
+    } catch (error) {
+      lastError = error
+      if (attempt < attempts - 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 120 * (attempt + 1)))
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('本地存储写入失败')
 }
 
 export const writeDatabase = (database: Database): void => {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(database))
 }
 
-export const applyReview = (flagId: string, payload: ReviewPayload): FeatureFlag => {
+export const applyReview = async (flagId: string, payload: ReviewPayload): Promise<FeatureFlag> => {
   const db = readDatabase()
   const flag = db.flags.find((item) => item.id === flagId)
   if (!flag) throw new Error('功能开关不存在')
-  const before = flag.status
+  const before: FeatureFlag = { ...flag }
+  const beforeStatus = flag.status
+  const timestamp = new Date().toISOString()
   flag.status = payload.decision === 'approved' ? 'active' : 'draft'
   flag.enabled = payload.decision === 'approved'
-  flag.updatedAt = new Date().toISOString()
+  flag.updatedAt = timestamp
   flag.lastChangedBy = payload.reviewer
+  if (payload.freezeUntil && payload.decision === 'approved') {
+    flag.rollbackConditions.push(`冻结至 ${payload.freezeUntil}，期间禁止扩大流量`)
+  }
+  flag.version += 1
+  flag.versionedAt = timestamp
   db.audit.unshift({
     id: `audit-${Date.now()}`,
     flagId,
@@ -405,31 +474,44 @@ export const applyReview = (flagId: string, payload: ReviewPayload): FeatureFlag
     action: payload.decision,
     actor: payload.reviewer,
     summary: payload.comment,
-    before,
+    before: beforeStatus,
     after: flag.status,
+    changes: [
+      { field: 'status', label: '状态', oldValue: beforeStatus, newValue: flag.status },
+      { field: 'enabled', label: '启用状态', oldValue: before.enabled ? '已启用' : '已关闭', newValue: flag.enabled ? '已启用' : '已关闭' },
+      ...(payload.freezeUntil && payload.decision === 'approved'
+        ? [{ field: 'rollbackConditions', label: '回滚条件', oldValue: before.rollbackConditions.join('、') || '（空）', newValue: flag.rollbackConditions.join('、') }]
+        : []),
+    ],
+    version: flag.version,
     affectedUsers: Math.round(120000 * (flag.rolloutPercentage / 100)),
-    createdAt: new Date().toISOString(),
+    createdAt: timestamp,
   })
-  if (payload.freezeUntil && payload.decision === 'approved') {
-    flag.rollbackConditions.push(`冻结至 ${payload.freezeUntil}，期间禁止扩大流量`)
-  }
-  writeDatabase(db)
+  await persistDatabase(db)
   return flag
 }
 
-export const rollbackFlag = (flagId: string, actor: string, reason: string): FeatureFlag => {
+export const rollbackFlag = async (
+  flagId: string,
+  actor: string,
+  reason: string,
+): Promise<FeatureFlag> => {
   const db = readDatabase()
   const flag = db.flags.find((item) => item.id === flagId)
   if (!flag) throw new Error('功能开关不存在')
-  const before = `${flag.status} / ${flag.rolloutPercentage}%`
+  const before: FeatureFlag = { ...flag }
+  const beforeSummary = `${flag.status} / ${flag.rolloutPercentage}%`
+  const timestamp = new Date().toISOString()
   flag.status = 'rolled-back'
   flag.enabled = false
   flag.rolloutPercentage = 0
-  flag.updatedAt = new Date().toISOString()
+  flag.updatedAt = timestamp
   flag.lastChangedBy = actor
   flag.rolloutSteps.forEach((step) => {
     if (step.status === 'running') step.status = 'paused'
   })
+  flag.version += 1
+  flag.versionedAt = timestamp
   db.audit.unshift({
     id: `audit-${Date.now()}`,
     flagId,
@@ -437,12 +519,19 @@ export const rollbackFlag = (flagId: string, actor: string, reason: string): Fea
     action: 'rolled-back',
     actor,
     summary: reason,
-    before,
+    before: beforeSummary,
     after: 'rolled-back / 0%',
-    affectedUsers: Math.round(980000 * (flag.rolloutPercentage / 100)),
-    createdAt: new Date().toISOString(),
+    changes: [
+      { field: 'status', label: '状态', oldValue: before.status, newValue: 'rolled-back' },
+      { field: 'enabled', label: '启用状态', oldValue: before.enabled ? '已启用' : '已关闭', newValue: '已关闭' },
+      { field: 'rolloutPercentage', label: '灰度比例', oldValue: `${before.rolloutPercentage}%`, newValue: '0%' },
+      { field: 'rolloutSteps', label: '灰度阶段', oldValue: before.rolloutSteps.map((s, i) => `${i + 1}. ${s.percentage}% · ${s.status}`).join('；'), newValue: flag.rolloutSteps.map((s, i) => `${i + 1}. ${s.percentage}% · ${s.status}`).join('；') },
+    ],
+    version: flag.version,
+    affectedUsers: Math.round(980000 * (before.rolloutPercentage / 100)),
+    createdAt: timestamp,
   })
-  writeDatabase(db)
+  await persistDatabase(db)
   return flag
 }
 

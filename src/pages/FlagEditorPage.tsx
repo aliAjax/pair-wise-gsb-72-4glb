@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Box,
@@ -24,11 +24,31 @@ import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline'
 import SaveOutlinedIcon from '@mui/icons-material/SaveOutlined'
 import SendOutlinedIcon from '@mui/icons-material/SendOutlined'
 import ArrowBackIcon from '@mui/icons-material/ArrowBack'
+import AutorenewIcon from '@mui/icons-material/Autorenew'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { useGetAuditQuery, useGetFlagQuery, useGetFlagsQuery, useSaveFlagMutation, useSubmitForReviewMutation } from '@/services/flagApi'
+import {
+  useDiscardCommitMutation,
+  useGetAuditQuery,
+  useGetFlagQuery,
+  useGetFlagsQuery,
+  useGetPendingCommitQuery,
+  useListPendingCommitsQuery,
+  useRetryCommitMutation,
+  useSaveFlagMutation,
+} from '@/services/flagApi'
 import { FlagStatusChip } from '@/components/FlagStatusChip'
 import { DependencyGraph } from '@/components/DependencyGraph'
-import type { AudienceRule, Dependency, FeatureFlag, RuleOperator, RolloutStep } from '@/types'
+import { ConflictResolutionDialog } from '@/components/ConflictResolutionDialog'
+import type {
+  AudienceRule,
+  CommitMode,
+  Dependency,
+  FeatureFlag,
+  FieldConflict,
+  FieldResolution,
+  RuleOperator,
+  RolloutStep,
+} from '@/types'
 
 const now = new Date().toISOString()
 
@@ -53,6 +73,8 @@ const emptyFlag = (): FeatureFlag => ({
   rolloutSteps: [],
   createdAt: now,
   updatedAt: now,
+  version: 0,
+  versionedAt: now,
   lastChangedBy: '林默',
 })
 
@@ -65,25 +87,94 @@ const operators: Array<{ value: RuleOperator; label: string }> = [
   { value: 'lte', label: '小于等于' },
 ]
 
+interface ConflictState {
+  conflicts: FieldConflict[]
+  baseVersion: number
+  serverVersion: number
+  commitId: string
+}
+
 export function FlagEditorPage() {
   const { id } = useParams()
   const isNew = !id || id === 'new'
   const navigate = useNavigate()
   const [tab, setTab] = useState(0)
   const [draft, setDraft] = useState<FeatureFlag>(emptyFlag)
+  /** 打开页面时记下的版本与完整快照，提交前据此做版本校验 */
+  const [baseFlag, setBaseFlag] = useState<FeatureFlag | null>(null)
   const [errors, setErrors] = useState<string[]>([])
-  const [savedFlag, setSavedFlag] = useState<FeatureFlag | null>(null)
+  const [notice, setNotice] = useState<{ severity: 'success' | 'info' | 'warning' | 'error'; text: string } | null>(null)
   const [metricInput, setMetricInput] = useState('')
+  const [conflict, setConflict] = useState<ConflictState | null>(null)
+  const [pendingId, setPendingId] = useState<string>(id && !isNew ? id : '')
+  /** 新建开关刷新后，从 outbox 恢复其待提交 ID */
+  const [newPendingId, setNewPendingId] = useState('')
+
   const { data: existing, isLoading } = useGetFlagQuery(id ?? '', { skip: isNew })
   const { data: allFlags = [] } = useGetFlagsQuery({})
   const { data: audit = [] } = useGetAuditQuery({ flagId: id ?? '' }, { skip: isNew })
+  const { data: allPending = [] } = useListPendingCommitsQuery(undefined, {
+    skip: !isNew,
+    refetchOnMountOrArgChange: true,
+  })
+  const activePendingId = pendingId || newPendingId
+  const { currentData: pending } = useGetPendingCommitQuery(activePendingId, {
+    skip: !activePendingId,
+    refetchOnMountOrArgChange: true,
+  })
   const [saveFlag, saveState] = useSaveFlagMutation()
-  const [submitReview, submitState] = useSubmitForReviewMutation()
-  const activeFlag = savedFlag ?? draft
+  const [retryCommit, retryState] = useRetryCommitMutation()
+  const [discardCommit] = useDiscardCommitMutation()
 
+  const baseLoaded = useRef(false)
+
+  // 新建页刷新后：从 outbox 找回未完成的新建提交
   useEffect(() => {
-    if (existing) setDraft(existing)
+    if (!isNew || newPendingId) return
+    const orphan = allPending.find((item) => item.request.baseVersion === 0)
+    if (orphan) {
+      setNewPendingId(orphan.request.flagId)
+      setBaseFlag(orphan.request.base)
+      setDraft(orphan.request.intent)
+      setNotice({ severity: 'info', text: '已恢复一笔未完成的新建提交，可继续保存或放弃。' })
+    }
+  }, [allPending, isNew, newPendingId])
+
+  // 首次加载服务端配置：记录 base 快照（记下当时版本）
+  useEffect(() => {
+    if (existing && !baseLoaded.current) {
+      baseLoaded.current = true
+      setBaseFlag(existing)
+      setDraft(existing)
+    }
   }, [existing])
+
+  // 重新打开时若该开关存在未完成提交：接着完成同一笔提交
+  useEffect(() => {
+    if (pending && !conflict) {
+      setDraft(pending.request.intent)
+      if (!baseFlag) setBaseFlag(pending.request.base)
+      if (pending.lastConflict && pending.lastConflict.conflicts.length > 0) {
+        setConflict({
+          conflicts: pending.lastConflict.conflicts,
+          baseVersion: pending.request.baseVersion,
+          serverVersion: pending.lastConflict.serverVersion,
+          commitId: pending.request.commitId,
+        })
+      } else if (pending.lastError) {
+        setNotice({
+          severity: 'warning',
+          text: `上一次保存因本地存储短暂失败未完成（${pending.lastError}），配置未受影响，可直接重试。`,
+        })
+      } else {
+        setNotice({ severity: 'info', text: '检测到一笔未完成的保存，可继续提交或放弃。' })
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending?.request.commitId])
+
+  const busy = saveState.isLoading || retryState.isLoading
+  const activeFlag = draft
 
   const availableDependencies = useMemo(
     () => allFlags.filter((flag) => flag.id !== activeFlag.id),
@@ -113,29 +204,159 @@ export function FlagEditorPage() {
     return nextErrors.length === 0
   }
 
-  const persist = async () => {
-    if (!validate()) return null
+  const runSave = async (mode: CommitMode): Promise<boolean> => {
+    if (!validate()) return false
+    const base = baseFlag ?? { ...emptyFlag(), id: draft.id }
     try {
-      const result = await saveFlag({ ...draft, updatedAt: new Date().toISOString() }).unwrap()
-      setSavedFlag(result)
-      setDraft(result)
-      if (isNew) navigate(`/flags/${result.id}`, { replace: true })
-      return result
+      const outcome = await saveFlag({
+        commitId: pending?.request.commitId,
+        flagId: draft.id,
+        mode,
+        actor: draft.lastChangedBy,
+        baseVersion: base.version,
+        base,
+        intent: draft,
+      }).unwrap()
+
+      if (outcome.type === 'conflict') {
+        if (outcome.conflicts.length === 0) {
+          setNotice({ severity: 'error', text: outcome.message })
+          return false
+        }
+        if (isNew) setNewPendingId(draft.id)
+        else setPendingId(draft.id)
+        setConflict({
+          conflicts: outcome.conflicts,
+          baseVersion: base.version,
+          serverVersion: outcome.serverVersion,
+          commitId: outcome.commitId,
+        })
+        setNotice({ severity: 'warning', text: outcome.message })
+        return false
+      }
+
+      if (outcome.type === 'storage-error') {
+        if (isNew) setNewPendingId(draft.id)
+        else setPendingId(draft.id)
+        setNotice({
+          severity: 'warning',
+          text: `本地存储短暂失败，配置未被部分写入；提交已暂存，请点击“重试未完成保存”。（${outcome.message}）`,
+        })
+        return false
+      }
+
+      if (outcome.type === 'not-found') {
+        setNotice({ severity: 'error', text: outcome.message })
+        return false
+      }
+
+      // committed：保存原子完成
+      setBaseFlag(outcome.flag)
+      setDraft(outcome.flag)
+      setPendingId('')
+      setNewPendingId('')
+      setConflict(null)
+      if (isNew) {
+        navigate(`/flags/${outcome.flag.id}`, { replace: true })
+      }
+      if (outcome.wasSubmit) {
+        navigate('/review')
+      } else {
+        setNotice({ severity: 'success', text: `已保存为 v${outcome.flag.version}，旧值与变更已写入审计记录。` })
+      }
+      return true
     } catch {
-      setErrors(['保存失败，请检查本地存储权限后重试'])
-      return null
+      // 网络层异常（含刷新中断）：outbox 仍保留该提交，重新打开可继续
+      if (isNew) setNewPendingId(draft.id)
+      else setPendingId(draft.id)
+      setErrors(['保存中断，提交已保留为未完成状态，可重试同一笔提交。'])
+      return false
     }
   }
 
-  const handleSubmit = async () => {
-    const saved = await persist()
-    if (!saved) return
+  const handleConflictResolve = async (resolutions: Record<string, FieldResolution>) => {
+    if (!conflict) return
+    const typed = resolutions as Partial<Record<FieldConflict['field'] & string, FieldResolution>>
     try {
-      await submitReview({ id: saved.id, actor: saved.lastChangedBy }).unwrap()
-      navigate('/review')
+      const outcome = await retryCommit({ flagId: draft.id, resolutions: typed }).unwrap()
+      if (outcome.type === 'conflict') {
+        // 对方又前进了一版，或还有未定稿项：更新清单继续定稿
+        setConflict({
+          conflicts: outcome.conflicts,
+          baseVersion: conflict.baseVersion,
+          serverVersion: outcome.serverVersion,
+          commitId: outcome.commitId,
+        })
+        setNotice({ severity: 'warning', text: outcome.message })
+        return
+      }
+      if (outcome.type === 'storage-error') {
+        setNotice({ severity: 'warning', text: `本地存储仍不可用，定稿已暂存，请稍后重试。（${outcome.message}）` })
+        return
+      }
+      if (outcome.type === 'not-found') {
+        setNotice({ severity: 'error', text: outcome.message })
+        return
+      }
+      setBaseFlag(outcome.flag)
+      setDraft(outcome.flag)
+      setPendingId('')
+      setNewPendingId('')
+      setConflict(null)
+      const wasSubmit = pending?.request.mode === 'submit'
+      if (wasSubmit || outcome.wasSubmit) {
+        navigate('/review')
+      } else {
+        setNotice({ severity: 'success', text: `冲突已定稿并保存为 v${outcome.flag.version}，三方值与定稿选择已写入审计。` })
+      }
     } catch {
-      setErrors(['提交评审失败，请稍后重试'])
+      setErrors(['定稿提交中断，请点击重试继续同一笔提交。'])
     }
+  }
+
+  const retryPending = async () => {
+    try {
+      const outcome = await retryCommit({ flagId: draft.id }).unwrap()
+      if (outcome.type === 'conflict') {
+        setConflict({
+          conflicts: outcome.conflicts,
+          baseVersion: pending?.request.baseVersion ?? 0,
+          serverVersion: outcome.serverVersion,
+          commitId: outcome.commitId,
+        })
+      } else if (outcome.type === 'storage-error') {
+        setNotice({ severity: 'warning', text: `本地存储仍不可用，请稍后重试。（${outcome.message}）` })
+      } else if (outcome.type === 'not-found') {
+        setNotice({ severity: 'error', text: outcome.message })
+      } else {
+        setBaseFlag(outcome.flag)
+        setDraft(outcome.flag)
+        setPendingId('')
+        setNewPendingId('')
+        setConflict(null)
+        if (outcome.wasSubmit) navigate('/review')
+        else setNotice({ severity: 'success', text: `未完成提交已成功保存为 v${outcome.flag.version}。` })
+      }
+    } catch {
+      setErrors(['重试失败，请再次点击重试。'])
+    }
+  }
+
+  const abandonPending = async () => {
+    if (!activePendingId) return
+    await discardCommit(draft.id).unwrap().catch(() => undefined)
+    setPendingId('')
+    setNewPendingId('')
+    setConflict(null)
+    if (existing) {
+      setBaseFlag(existing)
+      setDraft(existing)
+    } else {
+      const fresh = emptyFlag()
+      setBaseFlag(null)
+      setDraft(fresh)
+    }
+    setNotice({ severity: 'info', text: '已放弃该笔未完成提交，配置未发生任何变化。' })
   }
 
   const addRule = () => {
@@ -195,9 +416,13 @@ export function FlagEditorPage() {
           <Stack direction="row" spacing={1.2} alignItems="center">
             <Typography variant="h2">{isNew ? '创建功能开关' : activeFlag.name || '未命名开关'}</Typography>
             <FlagStatusChip status={activeFlag.status} />
+            {baseFlag && baseFlag.version > 0 && (
+              <Chip size="small" variant="outlined" color="primary" label={`基于 v${baseFlag.version} 编辑`} />
+            )}
           </Stack>
           <Typography color="text.secondary">
-            {activeFlag.key || '尚未设置 Key'} · 最近更新 {activeFlag.updatedAt.slice(0, 16).replace('T', ' ')}
+            {activeFlag.key || '尚未设置 Key'} · 当前 v{activeFlag.version || '新建'} · 最近更新{' '}
+            {activeFlag.updatedAt.slice(0, 16).replace('T', ' ')}
           </Typography>
         </Box>
         <Stack direction="row" spacing={1}>
@@ -207,21 +432,50 @@ export function FlagEditorPage() {
           <Button
             variant="outlined"
             startIcon={<SaveOutlinedIcon />}
-            loading={saveState.isLoading}
-            onClick={() => void persist()}
+            loading={busy}
+            disabled={Boolean(pending)}
+            onClick={() => void runSave('save')}
           >
-            保存草稿
+            {pending ? '存在未完成保存' : '保存草稿'}
           </Button>
           <Button
             variant="contained"
             startIcon={<SendOutlinedIcon />}
-            loading={submitState.isLoading}
-            onClick={() => void handleSubmit()}
+            loading={busy}
+            disabled={Boolean(pending)}
+            onClick={() => void runSave('submit')}
           >
-            提交影响评审
+            保存并提交评审
           </Button>
         </Stack>
       </Box>
+
+      {pending && (
+        <Alert
+          severity="warning"
+          sx={{ mb: 2 }}
+          action={
+            <Stack direction="row" spacing={1}>
+              <Button size="small" startIcon={<AutorenewIcon />} loading={retryState.isLoading} onClick={() => void retryPending()}>
+                重试未完成保存
+              </Button>
+              <Button size="small" color="inherit" onClick={() => void abandonPending()}>
+                放弃该提交
+              </Button>
+            </Stack>
+          }
+        >
+          有一笔{`“${pending.request.mode === 'submit' ? '保存并提交评审' : '保存草稿'}”`}尚未完成（创建于{' '}
+          {pending.createdAt.slice(0, 16).replace('T', ' ')}，已尝试 {pending.attempts} 次）。
+          {pending.lastError ? `原因：${pending.lastError}。` : '页面刷新或中断不会丢失，可继续同一笔提交。'}
+        </Alert>
+      )}
+
+      {notice && (
+        <Alert severity={notice.severity} onClose={() => setNotice(null)} sx={{ mb: 2 }}>
+          {notice.text}
+        </Alert>
+      )}
 
       {errors.length > 0 && (
         <Alert severity="error" onClose={() => setErrors([])} sx={{ mb: 2 }}>
@@ -531,11 +785,31 @@ export function FlagEditorPage() {
                     <Typography variant="body2" fontWeight={700}>{event.summary}</Typography>
                     <Typography variant="caption" color="text.secondary">
                       {event.actor} · {event.createdAt.slice(0, 16).replace('T', ' ')}
+                      {event.version ? ` · v${event.version}` : ''}
                     </Typography>
                     {(event.before || event.after) && (
                       <Typography variant="caption" display="block" color="text.secondary">
                         {event.before || '-'} → {event.after || '-'}
                       </Typography>
+                    )}
+                    {event.changes && event.changes.length > 0 && (
+                      <Stack spacing={0.5} sx={{ mt: 0.5 }}>
+                        {event.changes.map((change) => (
+                          <Box key={`${event.id}-${change.field}`}>
+                            <Chip
+                              size="small"
+                              variant="outlined"
+                              color={change.conflict ? 'warning' : 'default'}
+                              label={
+                                change.conflict
+                                  ? `${change.label}（冲突定稿·采用${change.resolution === 'mine' ? '本人' : '对方'}）：${change.oldValue} → ${change.newValue}`
+                                  : `${change.label}：${change.oldValue} → ${change.newValue}`
+                              }
+                              sx={{ maxWidth: '100%', height: 'auto', '& .MuiChip-label': { whiteSpace: 'normal', py: 0.3 } }}
+                            />
+                          </Box>
+                        ))}
+                      </Stack>
                     )}
                   </Box>
                 </Box>
@@ -545,6 +819,17 @@ export function FlagEditorPage() {
           </CardContent>
         )}
       </Card>
+
+      <ConflictResolutionDialog
+        open={Boolean(conflict)}
+        conflicts={conflict?.conflicts ?? []}
+        baseVersion={conflict?.baseVersion ?? 0}
+        serverVersion={conflict?.serverVersion ?? 0}
+        actor={draft.lastChangedBy}
+        busy={retryState.isLoading}
+        onResolve={(resolutions) => void handleConflictResolve(resolutions)}
+        onClose={() => setConflict(null)}
+      />
     </Box>
   )
 }

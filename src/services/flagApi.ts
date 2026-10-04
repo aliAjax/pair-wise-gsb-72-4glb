@@ -4,24 +4,46 @@ import {
   getDashboardStats,
   readDatabase,
   rollbackFlag,
-  writeDatabase,
 } from '@/services/database'
+import {
+  discardPendingCommit,
+  executeCommit,
+  getPendingCommit,
+  listPendingCommits,
+  retryPendingCommit,
+} from '@/services/commitLog'
 import type {
   AuditEvent,
+  CommitOutcome,
   DashboardData,
+  EditableField,
   FeatureFlag,
+  FieldResolution,
   FlagFilter,
   ImpactIssue,
+  PendingCommit,
   ReviewPayload,
+  SaveRequest,
 } from '@/types'
 
 const delay = (milliseconds = 180) =>
   new Promise((resolve) => window.setTimeout(resolve, milliseconds))
 
+const commitInvalidation = (result?: CommitOutcome) =>
+  result?.type === 'committed'
+    ? ([
+        'Flags',
+        'Dashboard',
+        'Audit',
+        'PendingCommits',
+        { type: 'Flag' as const, id: result.flag.id },
+      ] as const)
+    : (['PendingCommits'] as const)
+
 export const flagApi = createApi({
   reducerPath: 'flagApi',
   baseQuery: fakeBaseQuery<{ message: string }>(),
-  tagTypes: ['Flags', 'Flag', 'Issues', 'Audit', 'Dashboard'],
+  tagTypes: ['Flags', 'Flag', 'Issues', 'Audit', 'Dashboard', 'PendingCommits'],
   endpoints: (builder) => ({
     getDashboard: builder.query<DashboardData, void>({
       async queryFn() {
@@ -57,82 +79,66 @@ export const flagApi = createApi({
       },
       providesTags: (_result, _error, id) => [{ type: 'Flag', id }],
     }),
-    saveFlag: builder.mutation<FeatureFlag, FeatureFlag>({
-      async queryFn(flag) {
+    /**
+     * 版本校验保存：
+     * - 冲突时返回 { type: 'conflict' }，由页面逐项定稿后带 resolutions 重试同一笔提交；
+     * - 存储短暂失败返回 { type: 'storage-error' }，提交已在 outbox，可直接重试；
+     * - 成功返回 { type: 'committed' }。
+     */
+    saveFlag: builder.mutation<CommitOutcome, SaveRequest>({
+      async queryFn(request) {
         await delay(260)
-        const db = readDatabase()
-        const index = db.flags.findIndex((item) => item.id === flag.id)
-        const next = { ...flag, updatedAt: new Date().toISOString() }
-        if (index >= 0) {
-          const before = db.flags[index]
-          db.flags[index] = next
-          db.audit.unshift({
-            id: `audit-${Date.now()}`,
-            flagId: flag.id,
-            flagKey: flag.key,
-            action: 'updated',
-            actor: flag.lastChangedBy,
-            summary: '更新开关受众、依赖、版本或回滚条件。',
-            before: before.status,
-            after: next.status,
-            affectedUsers: Math.round(900000 * (next.rolloutPercentage / 100)),
-            createdAt: new Date().toISOString(),
-          })
-        } else {
-          db.flags.unshift(next)
-          db.audit.unshift({
-            id: `audit-${Date.now()}`,
-            flagId: next.id,
-            flagKey: next.key,
-            action: 'created',
-            actor: next.lastChangedBy,
-            summary: '创建功能开关草稿。',
-            after: next.status,
-            affectedUsers: 0,
-            createdAt: new Date().toISOString(),
-          })
-        }
-        writeDatabase(db)
-        return { data: next }
-      },
-      invalidatesTags: ['Flags', 'Dashboard', 'Audit'],
-    }),
-    submitForReview: builder.mutation<FeatureFlag, { id: string; actor: string }>({
-      async queryFn({ id, actor }) {
-        await delay(220)
-        const db = readDatabase()
-        const flag = db.flags.find((item) => item.id === id)
-        if (!flag) return { error: { message: '功能开关不存在' } }
-        flag.status = 'review'
-        flag.updatedAt = new Date().toISOString()
-        flag.lastChangedBy = actor
-        db.audit.unshift({
-          id: `audit-${Date.now()}`,
-          flagId: id,
-          flagKey: flag.key,
-          action: 'submitted',
-          actor,
-          summary: '提交发布影响评审。',
-          before: 'draft',
-          after: 'review',
-          affectedUsers: Math.round(900000 * (flag.rolloutPercentage / 100)),
-          createdAt: new Date().toISOString(),
+        const outcome = await executeCommit({
+          commitId: request.commitId ?? `commit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          flagId: request.flagId,
+          mode: request.mode,
+          actor: request.actor,
+          baseVersion: request.baseVersion,
+          base: request.base,
+          intent: request.intent,
+          resolutions: request.resolutions,
         })
-        writeDatabase(db)
-        return { data: flag }
+        return { data: outcome }
       },
-      invalidatesTags: (_result, _error, arg) => [
-        'Flags',
-        'Dashboard',
-        'Audit',
-        { type: 'Flag', id: arg.id },
-      ],
+      invalidatesTags: (_result) => commitInvalidation(_result),
+    }),
+    /** 继续 outbox 中同一笔未完成提交（刷新页面 / 存储失败恢复 / 冲突定稿后重试） */
+    retryCommit: builder.mutation<
+      CommitOutcome,
+      { flagId: string; resolutions?: Partial<Record<EditableField, FieldResolution>> }
+    >({
+      async queryFn({ flagId, resolutions }) {
+        await delay(220)
+        return { data: await retryPendingCommit(flagId, resolutions) }
+      },
+      invalidatesTags: (_result) => commitInvalidation(_result),
+    }),
+    /** 放弃未完成提交，清理本地 outbox */
+    discardCommit: builder.mutation<void, string>({
+      async queryFn(flagId) {
+        await discardPendingCommit(flagId)
+        return { data: undefined }
+      },
+      invalidatesTags: ['PendingCommits'],
+    }),
+    getPendingCommit: builder.query<PendingCommit | undefined, string>({
+      async queryFn(flagId) {
+        await delay(60)
+        return { data: getPendingCommit(flagId) }
+      },
+      providesTags: (_result, _error, flagId) => [{ type: 'PendingCommits' }, { type: 'Flag', id: flagId }],
+    }),
+    listPendingCommits: builder.query<PendingCommit[], void>({
+      async queryFn() {
+        return { data: listPendingCommits() }
+      },
+      providesTags: ['PendingCommits'],
     }),
     reviewFlag: builder.mutation<FeatureFlag, { id: string; payload: ReviewPayload }>({
       async queryFn({ id, payload }) {
         await delay(260)
         try {
-          return { data: applyReview(id, payload) }
+          return { data: await applyReview(id, payload) }
         } catch (error) {
           return { error: { message: error instanceof Error ? error.message : '审批失败' } }
         }
@@ -148,7 +154,7 @@ export const flagApi = createApi({
       async queryFn({ id, actor, reason }) {
         await delay(260)
         try {
-          return { data: rollbackFlag(id, actor, reason) }
+          return { data: await rollbackFlag(id, actor, reason) }
         } catch (error) {
           return { error: { message: error instanceof Error ? error.message : '回滚失败' } }
         }
@@ -192,9 +198,31 @@ export const {
   useGetFlagsQuery,
   useGetFlagQuery,
   useSaveFlagMutation,
-  useSubmitForReviewMutation,
+  useRetryCommitMutation,
+  useDiscardCommitMutation,
+  useGetPendingCommitQuery,
+  useListPendingCommitsQuery,
   useReviewFlagMutation,
   useRollbackFlagMutation,
   useGetIssuesQuery,
   useGetAuditQuery,
 } = flagApi
+
+/**
+ * 其他标签页写入主库或 outbox 后（storage 事件只在非当前标签页触发），
+ * 让本标签页的缓存失效，保证打开编辑器时能立刻看到版本前进并弹出冲突。
+ */
+export const setupCrossTabSync = (
+  onInvalidate: (tags: Parameters<typeof flagApi.util.invalidateTags>[0]) => void,
+): (() => void) => {
+  const listener = (event: StorageEvent) => {
+    if (!event.key) return
+    if (event.key.includes('pending-commits')) {
+      onInvalidate(['PendingCommits'])
+    } else {
+      onInvalidate(['Flags', 'Flag', 'Audit', 'Dashboard', 'PendingCommits'])
+    }
+  }
+  window.addEventListener('storage', listener)
+  return () => window.removeEventListener('storage', listener)
+}

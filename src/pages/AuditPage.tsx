@@ -139,7 +139,31 @@ export function AuditPage() {
                       <Typography component={Link} to={`/flags/${event.flagId}`} variant="body2" fontWeight={700}>{event.flagKey}</Typography>
                       {relatedFlag && <FlagStatusChip status={relatedFlag.status} />}
                     </TableCell>
-                    <TableCell sx={{ maxWidth: 420 }}>{event.summary}</TableCell>
+                    <TableCell sx={{ maxWidth: 420 }}>
+                      <Typography variant="body2">{event.summary}</Typography>
+                      {event.changes && event.changes.length > 0 && (
+                        <Stack spacing={0.5} sx={{ mt: 0.5 }}>
+                          {event.changes.map((change) => (
+                            <Typography
+                              key={`${event.id}-${change.field}`}
+                              variant="caption"
+                              component="div"
+                              color={change.conflict ? 'warning.main' : 'text.secondary'}
+                              sx={{ whiteSpace: 'normal' }}
+                            >
+                              {change.conflict ? '⚠ ' : ''}
+                              {change.label}
+                              {change.conflict
+                                ? `冲突定稿（采用${change.resolution === 'mine' ? '本人' : '对方'}）：旧值 ${change.baseValue}｜本人 ${change.mineValue}｜对方 ${change.theirsValue} → 最终 ${change.newValue}`
+                                : `：${change.oldValue} → ${change.newValue}`}
+                            </Typography>
+                          ))}
+                        </Stack>
+                      )}
+                      {event.version && (
+                        <Typography variant="caption" color="primary.main">保存后版本 v{event.version}</Typography>
+                      )}
+                    </TableCell>
                     <TableCell>
                       <Chip size="small" variant="outlined" label={`${event.before || '-'} → ${event.after || '-'}`} />
                     </TableCell>

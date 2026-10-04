@@ -55,34 +55,64 @@ export function RolloutPage() {
     const nextPercentage =
       steps.find((step) => step.status === 'running')?.percentage ?? flag.rolloutPercentage
     try {
-      await saveFlag({
-        ...flag,
-        rolloutSteps: steps,
-        rolloutPercentage: nextPercentage,
-        enabled: true,
-        status: 'active',
-        lastChangedBy: '林默',
+      const outcome = await saveFlag({
+        flagId: flag.id,
+        mode: 'save',
+        actor: '林默',
+        baseVersion: flag.version,
+        base: flag,
+        intent: {
+          ...flag,
+          rolloutSteps: steps,
+          rolloutPercentage: nextPercentage,
+          enabled: true,
+          status: 'active',
+          lastChangedBy: '林默',
+        },
       }).unwrap()
-      setMessage(`灰度已推进至 ${nextPercentage}%，新的回滚边界已保存`)
+      if (outcome.type === 'conflict') {
+        setMessage(`该开关已被更新到 v${outcome.serverVersion}，请进入编辑器逐项定稿 ${outcome.conflicts.length} 个冲突字段后再推进。`)
+      } else if (outcome.type === 'storage-error') {
+        setMessage('本地存储短暂失败，推进已暂存为未完成提交，重新打开编辑器可继续同一笔操作。')
+      } else if (outcome.type === 'committed') {
+        setMessage(`灰度已推进至 ${nextPercentage}%（v${outcome.flag.version}），新的回滚边界已保存`)
+      } else {
+        setMessage(outcome.message)
+      }
     } catch {
-      setMessage('推进失败，请检查配置后重试')
+      setMessage('推进失败，提交已暂存，可在编辑器中重试同一笔操作')
     }
   }
 
   const pauseRollout = async () => {
     if (!flag) return
     try {
-      await saveFlag({
-        ...flag,
-        status: 'frozen',
-        lastChangedBy: '林默',
-        rolloutSteps: flag.rolloutSteps.map((step) =>
-          step.status === 'running' ? { ...step, status: 'paused' } : step,
-        ),
+      const outcome = await saveFlag({
+        flagId: flag.id,
+        mode: 'save',
+        actor: '林默',
+        baseVersion: flag.version,
+        base: flag,
+        intent: {
+          ...flag,
+          status: 'frozen',
+          lastChangedBy: '林默',
+          rolloutSteps: flag.rolloutSteps.map((step) =>
+            step.status === 'running' ? { ...step, status: 'paused' } : step,
+          ),
+        },
       }).unwrap()
-      setMessage('灰度流量已冻结，现有用户继续使用当前配置')
+      if (outcome.type === 'conflict') {
+        setMessage(`该开关已被更新到 v${outcome.serverVersion}，请进入编辑器逐项定稿冲突字段后再冻结。`)
+      } else if (outcome.type === 'storage-error') {
+        setMessage('本地存储短暂失败，冻结操作已暂存为未完成提交，可继续重试。')
+      } else if (outcome.type === 'committed') {
+        setMessage(`灰度流量已冻结（v${outcome.flag.version}），现有用户继续使用当前配置`)
+      } else {
+        setMessage(outcome.message)
+      }
     } catch {
-      setMessage('冻结失败，请重试')
+      setMessage('冻结失败，提交已暂存，可在编辑器中重试同一笔操作')
     }
   }
 

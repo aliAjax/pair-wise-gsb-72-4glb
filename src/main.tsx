@@ -4,9 +4,12 @@ import { Provider } from 'react-redux'
 import { ThemeProvider, CssBaseline } from '@mui/material'
 import { RouterProvider } from 'react-router-dom'
 import { store } from '@/app/store'
+import { flagApi, setupCrossTabSync } from '@/services/flagApi'
 import { theme } from '@/app/theme'
 import { router } from '@/app/router'
 import '@/styles.css'
+
+setupCrossTabSync((tags) => store.dispatch(flagApi.util.invalidateTags(tags)))
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
